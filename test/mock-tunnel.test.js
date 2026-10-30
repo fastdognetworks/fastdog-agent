@@ -44,3 +44,57 @@ test('mock heartbeat replies keep a real WebSocket alive', async t => {
   await new Promise(resolve => setTimeout(resolve, 60));
   assert.equal(ws.readyState, 1); assert.ok(edge.frames.some(f => f.type === 'ping')); ws.terminate();
 });
+
+test('negotiated v1 WebSocket upgrade relays messages both ways', { timeout: 15000 }, async t => {
+  const { WebSocketServer } = await import('ws');
+  const origin = http.createServer((_req, res) => res.end());
+  const wss = new WebSocketServer({ server: origin });
+  const received = new Promise(resolve => wss.on('connection', (ws, req) => {
+    ws.on('message', data => {
+      resolve({ text: data.toString(), path: req.url, host: req.headers.host });
+      ws.send('reply');
+    });
+  }));
+  t.after(() => {
+    for (const ws of wss.clients) ws.terminate();
+    wss.close(); origin.closeAllConnections(); origin.close();
+  });
+  await new Promise(resolve => origin.listen(0, '127.0.0.1', resolve));
+  const credential = randomBytes(16).toString('hex');
+  const edge = await mockEdge({ credential, websocket: true });
+  t.after(() => edge.close());
+  const settings = {
+    EDGE_HTTP_URL: edge.url, EDGE_WS_URL: edge.url.replace('http:', 'ws:') + '/_fastdog/tunnel',
+    AGENT_TOKEN: credential, AGENT_LOCAL_UPSTREAM: `http://127.0.0.1:${origin.address().port}`,
+  };
+  const previous = Object.fromEntries(Object.keys(settings).map(key => [key, process.env[key]]));
+  Object.assign(process.env, settings);
+  t.after(() => { for (const [key, value] of Object.entries(previous)) {
+    if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  } });
+  const agent = await import('../src/index.js?websocket');
+  const reg = await agent.register();
+  const closed = agent.connectWs(reg.id, () => {});
+  const tunnel = await edge.connected;
+  const hello = await edge.waitForFrame(msg => msg.type === 'hello');
+  assert.deepEqual(hello.caps, ['stream', 'ws']);
+  edge.send({ type: 'req_start', sid: 1, websocket: true, method: 'GET', path: '/socket?x=1', headers: {
+    host: 'example.com', upgrade: 'websocket', connection: 'Upgrade',
+    'sec-websocket-version': '13', 'sec-websocket-key': randomBytes(16).toString('base64'),
+  } });
+  edge.send({ type: 'req_end', sid: 1 });
+  const response = await edge.waitForFrame(msg => msg.type === 'res_start' && msg.sid === 1);
+  assert.equal(response.status, 101);
+  assert.equal(response.headers.upgrade.toLowerCase(), 'websocket');
+  const mask = Buffer.from([1, 2, 3, 4]);
+  const payload = Buffer.from('hello');
+  edge.sendData(1, Buffer.concat([Buffer.from([0x81, 0x80 | payload.length]), mask,
+    Buffer.from(payload.map((byte, i) => byte ^ mask[i % 4]))]));
+  const reply = Buffer.from([0x81, 5, ...Buffer.from('reply')]);
+  await edge.waitForFrame(() => Buffer.concat(edge.frames.filter(f => f.type === 'data' && f.sid === 1).map(f => f.body)).length >= reply.length);
+  assert.deepEqual(await received, { text: 'hello', path: '/socket?x=1', host: 'example.com' });
+  assert.deepEqual(Buffer.concat(edge.frames.filter(f => f.type === 'data' && f.sid === 1).map(f => f.body)), reply);
+  edge.send({ type: 'ack', sid: 1, bytes: reply.length });
+  edge.send({ type: 'abort', sid: 1, closeCode: 1001 });
+  tunnel.close(); await closed;
+});

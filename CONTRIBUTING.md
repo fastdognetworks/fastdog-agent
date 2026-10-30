@@ -15,6 +15,6 @@ Keep changes focused, describe behavior and validation, and retain dependency
 integrity hashes. Do not submit credentials, environment files or identifying
 customer information. Report security issues using SECURITY.md.
 
-Contributions are under Apache-2.0. Before publishing, replace the repository
-source placeholder, confirm security contact and support policy, refresh the base
-image digest, and validate the image and tests on supported Node versions.
+Contributions are under Apache-2.0.
+
+CI runs `npm test` and `npm run scan:names` on Node 20 and 22.

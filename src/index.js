@@ -1,15 +1,25 @@
-/** Outbound FastDog connector: forwards tunnel requests to a configured local application. */
+/**
+ * FastDog tunnel agent.
+ *
+ * Outbound connector: registers with the edge control API, opens a WebSocket tunnel,
+ * receives HTTP-over-WS frames, forwards them to AGENT_LOCAL_UPSTREAM and returns the response.
+ *
+ * It makes outbound connections only; it does not listen for inbound connections.
+ * v1 streams support negotiated WebSocket upgrade passthrough; CONNECT is unsupported.
+ */
 import http from 'node:http';
+import { randomBytes } from 'node:crypto';
 import https from 'node:https';
 import { URL } from 'node:url';
 import { pathToFileURL } from 'node:url';
 import { readFileSync } from 'node:fs';
 import WebSocket from 'ws';
+import { FrameBoundary, WS_WINDOW_BYTES } from './ws-frames.js';
 import { computeBackoffMs } from './backoff.js';
 import { startHeartbeat, createHandoff } from './heartbeat.js';
 
 /**
- * The outbound authority is always the configured upstream. Only the path and query of the
+ * SV-1: the outbound authority is always the configured upstream. Only the path and query of the
  * client's request target are copied, so absolute-form ("http://other/x"), network-path ("//other/x")
  * and backslash ("/\\other/x") targets cannot retarget the upstream.
  */
@@ -34,8 +44,8 @@ function env(name, fallback) {
   return v === undefined || v === '' ? fallback : v;
 }
 
-const EDGE_HTTP = env('EDGE_HTTP_URL', 'https://fastdognetworks.com');
-const EDGE_WS = env('EDGE_WS_URL', 'wss://fastdognetworks.com/_fastdog/tunnel');
+const EDGE_HTTP = env('EDGE_HTTP_URL', 'http://127.0.0.1:8787');
+const EDGE_WS = env('EDGE_WS_URL', 'ws://127.0.0.1:8787/_fastdog/tunnel');
 const TOKEN = env('AGENT_TOKEN', '');
 const NAME = env('AGENT_NAME', '');
 const HOSTNAME = env('AGENT_HOSTNAME', '');
@@ -149,7 +159,7 @@ export function probeOrigin(upstream = LOCAL_UPSTREAM, { timeoutMs = 3000 } = {}
     req.end();
   });
 }
-// Reported in heartbeats so the edge can tell which agent version is connected.
+// Reported in heartbeats so the portal can tell which agent version is connected.
 const AGENT_VERSION = (() => {
   for (const rel of ['./package.json', '../package.json']) {
     try {
@@ -199,12 +209,12 @@ async function handleFrame(ws, msg, work) {
 }
 
 // Tunnel protocol v1 (streaming), used only after the edge's welcome advertises caps ['stream'] and this agent
-// answers with hello. Uses JSON control frames keyed by sid, binary data frames
+// answers with hello. Mirrors src/control/tunnels.js: JSON control frames keyed by sid, binary data frames
 // [0x01][sid uint32 BE][payload], and per-stream credit (ack) so at most STREAM_WINDOW_BYTES are unacknowledged.
 export const STREAM_CHUNK_BYTES = 64 * 1024;
 export const STREAM_WINDOW_BYTES = 1024 * 1024;
 // v1 origin socket inactivity timeout, raised to the header wait from req_end until the origin's response headers
-// (the protocol header wait). The v0 path keeps its own 25 s timeout.
+// (matches STREAM_HEADER_WAIT_MS in src/control/tunnels.js). The v0 path keeps its own 25 s timeout.
 export const ORIGIN_IDLE_MS = 25000;
 export const ORIGIN_HEADER_WAIT_MS = 120000;
 
@@ -219,12 +229,28 @@ export function createStreamHandler(ws, upstream = LOCAL_UPSTREAM, { idleMs = OR
   const streams = new Map();
   const sendJson = (obj) => { if (ws.readyState === 1) ws.send(JSON.stringify(obj)); };
 
-  function drop(sid, { notify = false } = {}) {
+  function drop(sid, { notify = false, closeCode = 1011, peerEnded = false } = {}) {
     const s = streams.get(sid);
     if (!s) return;
     streams.delete(sid);
     changed?.();
-    if (notify) sendJson({ type: 'abort', sid });
+    if (notify) sendJson({ type: 'abort', sid, closeCode });
+    if (s.socket) {
+      if (s.socket.destroyed) { s.req.destroy(); return; }
+      // Never send new application bytes after the origin has ended its stream.
+      // Client-to-origin frames must be masked, including this synthetic close.
+      if (!peerEnded && s.boundary.boundary && !s.boundary.closed) {
+        const code = closeCode === 1001 ? 1001 : 1011;
+        const mask = randomBytes(4);
+        s.socket.write(Buffer.from([0x88, 0x82, ...mask, (code >> 8) ^ mask[0], (code & 255) ^ mask[1]]));
+      }
+      const timer = setTimeout(() => s.socket.destroy(), 1000);
+      timer.unref?.();
+      s.socket.once('close', () => { clearTimeout(timer); s.req.destroy(); });
+      s.socket.end();
+      s.socket.destroySoon();
+      return;
+    }
     s.req.destroy();
     s.res?.destroy();
   }
@@ -239,8 +265,13 @@ export function createStreamHandler(ws, upstream = LOCAL_UPSTREAM, { idleMs = OR
     const hdrs = { ...(msg.headers || {}) };
     delete hdrs['transfer-encoding'];
     delete hdrs.connection;
+    if (msg.websocket) {
+      if (msg.method !== 'GET' || String(hdrs.upgrade).toLowerCase() !== 'websocket') throw new Error('unsupported upgrade');
+      hdrs.connection = 'Upgrade';
+      delete hdrs['content-length'];
+    }
     if (!hdrs.host && !hdrs.Host) hdrs.host = target.host;
-    const s = { req: null, res: null, inflight: 0, paused: false, ended: false };
+    const s = { req: null, res: null, inflight: 0, paused: false, ended: false, websocket: Boolean(msg.websocket), boundary: msg.websocket ? new FrameBoundary() : null, window: msg.websocket ? WS_WINDOW_BYTES : STREAM_WINDOW_BYTES, unflushed: 0 };
     s.req = lib.request({
       protocol: target.protocol, hostname: target.hostname, port: target.port || (target.protocol === 'https:' ? 443 : 80),
       path: target.pathname + target.search, method: msg.method, headers: hdrs, timeout: idleMs,
@@ -250,13 +281,17 @@ export function createStreamHandler(ws, upstream = LOCAL_UPSTREAM, { idleMs = OR
       changed?.();
       if (s.ended) s.req.setTimeout(idleMs);
       const headers = { ...res.headers };
+      if (s.websocket) {
+        for (const name of String(headers.connection || '').toLowerCase().split(',').map(v => v.trim())) delete headers[name];
+        for (const name of ['upgrade', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'proxy-connection']) delete headers[name];
+      }
       delete headers['transfer-encoding'];
       delete headers.connection;
       sendJson({ type: 'res_start', sid, status: res.statusCode || 502, headers });
       res.on('data', (c) => {
         for (let i = 0; i < c.length; i += STREAM_CHUNK_BYTES) ws.send(dataFrame(sid, c.subarray(i, i + STREAM_CHUNK_BYTES)));
         s.inflight += c.length;
-        if (s.inflight >= STREAM_WINDOW_BYTES && !s.paused) { s.paused = true; res.pause(); }
+        if (s.inflight >= s.window && !s.paused) { s.paused = true; res.pause(); }
       });
       res.on('end', () => {
         if (streams.delete(sid)) sendJson({ type: 'res_end', sid });
@@ -266,6 +301,29 @@ export function createStreamHandler(ws, upstream = LOCAL_UPSTREAM, { idleMs = OR
       });
       res.on('error', () => drop(sid, { notify: true }));
       res.on('close', () => { if (!res.complete) drop(sid, { notify: true }); });
+    });
+    s.req.on('upgrade', (res, socket, head) => {
+      if (!s.websocket || !streams.has(sid) || res.statusCode !== 101
+          || String(res.headers.upgrade).toLowerCase() !== 'websocket') {
+        socket.destroy(); drop(sid, { notify: true }); return;
+      }
+      s.socket = socket;
+      s.res = socket;
+      s.req.setTimeout(0); socket.setTimeout(0);
+      sendJson({ type: 'res_start', sid, status: 101, headers: res.headers });
+      function relay(c) {
+        if (!streams.has(sid)) return;
+        s.inflight += c.length;
+        if (s.inflight > s.window + STREAM_CHUNK_BYTES) return drop(sid, { notify: true });
+        for (let i = 0; i < c.length; i += STREAM_CHUNK_BYTES) ws.send(dataFrame(sid, c.subarray(i, i + STREAM_CHUNK_BYTES)));
+        if (s.inflight >= s.window) { s.paused = true; socket.pause(); }
+      }
+      socket.on('data', relay);
+      socket.on('end', () => drop(sid, { notify: true, peerEnded: true }));
+      socket.on('close', () => drop(sid, { notify: true }));
+      socket.on('error', () => drop(sid, { notify: true }));
+      if (head.length) relay(head);
+      changed?.();
     });
     // Once the response has started only its own outcome counts: an origin that answers early and closes makes
     // the unfinished upload fail with EPIPE/ECONNRESET, which must not throw away a complete response.
@@ -289,7 +347,17 @@ export function createStreamHandler(ws, upstream = LOCAL_UPSTREAM, { idleMs = OR
         const s = streams.get(sid);
         const payload = data.subarray(5);
         // Credit returns once the bytes are flushed towards the local app.
-        s?.req.write(payload, (err) => { if (!err && streams.has(sid)) sendJson({ type: 'ack', sid, bytes: payload.length }); });
+        if (!s) return true;
+        s.unflushed += payload.length;
+        if (payload.length > STREAM_CHUNK_BYTES || s.unflushed > s.window + STREAM_CHUNK_BYTES || (s.websocket && !s.socket)) {
+          drop(sid, { notify: true }); return true;
+        }
+        if (s.socket && !s.boundary.push(payload)) { drop(sid, { notify: true }); return true; }
+        (s.socket || s.req).write(payload, (err) => {
+          s.unflushed -= payload.length;
+          if (err) drop(sid, { notify: true });
+          else if (streams.has(sid)) sendJson({ type: 'ack', sid, bytes: payload.length });
+        });
         return true;
       }
       const s = streams.get(msg.sid);
@@ -307,22 +375,23 @@ export function createStreamHandler(ws, upstream = LOCAL_UPSTREAM, { idleMs = OR
             changed?.();
           }
           return true;
-        case 'abort': drop(msg.sid); return true;
+        case 'abort': drop(msg.sid, { closeCode: msg.closeCode }); return true;
         case 'ack':
           if (s) {
-            s.inflight = Math.max(0, s.inflight - (Number(msg.bytes) || 0));
-            if (s.paused && s.inflight < STREAM_WINDOW_BYTES) { s.paused = false; s.res?.resume(); }
+            if (!Number.isSafeInteger(msg.bytes) || msg.bytes <= 0 || msg.bytes > s.inflight) { drop(msg.sid, { notify: true }); return true; }
+            s.inflight -= msg.bytes;
+            if (s.paused && s.inflight < s.window) { s.paused = false; s.res?.resume(); }
           }
           return true;
         default: return false;
       }
     },
-    longBusy() { return [...streams.values()].some(s => s.drainUpload || !s.ended || s.res); },
+    longBusy() { return [...streams.values()].some(s => s.websocket || s.drainUpload || !s.ended || s.res); },
     expire(long) {
       for (const s of streams.values()) if (!s.ended) s.drainUpload = true;
-      for (const [sid, s] of streams) if (Boolean(s.drainUpload || !s.ended || s.res) === long) {
-        sendJson({ type: 'abort', sid, reason: 'tunnel_disconnected' });
-        drop(sid);
+      for (const [sid, s] of streams) if (Boolean(s.websocket || s.drainUpload || !s.ended || s.res) === long) {
+        sendJson({ type: 'abort', sid, reason: 'tunnel_disconnected', closeCode: 1001 });
+        drop(sid, { closeCode: 1001 });
       }
     },
     closeAll() { for (const sid of [...streams.keys()]) drop(sid); },
@@ -384,7 +453,7 @@ export function connectWs(agentId, onWelcome, lifecycle) {
       if (msg.type === 'welcome') {
         console.log('[agent] tunnel ready');
         // Opt into streaming only when the edge offers it; older edges keep the v0 framing.
-        if (Array.isArray(msg.caps) && msg.caps.includes('stream')) ws.send(JSON.stringify({ type: 'hello', caps: ['stream'] }));
+        if (Array.isArray(msg.caps) && msg.caps.includes('stream')) ws.send(JSON.stringify({ type: 'hello', caps: ['stream', ...(msg.caps.includes('ws') ? ['ws'] : [])] }));
         if (lifecycle) activeSocket = ws;
         onWelcome();
         return;

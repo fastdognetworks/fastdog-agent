@@ -1,10 +1,11 @@
 import http from 'node:http';
-import { once } from 'node:events';
+import { EventEmitter } from 'node:events';
 import { WebSocketServer } from 'ws';
 
 // A protocol fixture, not a production edge or authentication implementation.
-export async function mockEdge({ credential, streaming = true } = {}) {
+export async function mockEdge({ credential, streaming = true, websocket = false } = {}) {
   const frames = [], requests = [];
+  const events = new EventEmitter();
   let socket, next = 0;
   const pending = new Map();
   const server = http.createServer(async (req, res) => {
@@ -22,6 +23,7 @@ export async function mockEdge({ credential, streaming = true } = {}) {
     ws.on('message', (data, binary) => {
       const msg = binary ? { type: 'data', sid: data.readUInt32BE(1), body: data.subarray(5) } : JSON.parse(data);
       frames.push(msg);
+      events.emit('frame', msg);
       if (msg.type === 'ping') send({ type: 'pong' });
       const p = pending.get(msg.sid ?? msg.id);
       if (!p) return;
@@ -35,12 +37,26 @@ export async function mockEdge({ credential, streaming = true } = {}) {
         else p.resolve({ ...p.result, body: p.result.body ?? Buffer.concat(p.chunks) });
       }
     });
-    send({ type: 'welcome', ...(streaming ? { caps: ['stream'] } : {}) });
+    send({ type: 'welcome', ...(streaming ? { caps: ['stream', ...(websocket ? ['ws'] : [])] } : {}) });
     resolve(ws);
   }));
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   return {
     url: `http://127.0.0.1:${server.address().port}`, connected, frames, requests, send,
+    waitForFrame(predicate) {
+      const found = frames.find(predicate);
+      if (found) return Promise.resolve(found);
+      return new Promise((resolve, reject) => {
+        const cleanup = () => { clearTimeout(timer); events.off('frame', receive); };
+        const receive = msg => { if (predicate(msg)) { cleanup(); resolve(msg); } };
+        const timer = setTimeout(() => { cleanup(); reject(new Error('mock frame timeout')); }, 5000);
+        events.on('frame', receive);
+      });
+    },
+    sendData(sid, body) {
+      const head = Buffer.alloc(5); head[0] = 1; head.writeUInt32BE(sid, 1);
+      socket.send(Buffer.concat([head, body]));
+    },
     request({ method = 'POST', path = '/', headers = { host: 'app.example.com' }, body = Buffer.alloc(0) } = {}) {
       const sid = ++next;
       return new Promise((resolve, reject) => {

@@ -2,6 +2,9 @@
 !package.json
 !package-lock.json
 !src/
-!src/**
+!src/index.js
+!src/backoff.js
+!src/heartbeat.js
+!src/ws-frames.js
 !LICENSE
 !NOTICE

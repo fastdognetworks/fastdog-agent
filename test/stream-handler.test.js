@@ -45,7 +45,7 @@ test('stream credit pauses and resumes response; upload returns ack; abort clean
 });
 test('origin failure aborts and cleans up', t => {
   const f = fixture(t); f.req.emit('error', new Error('fixture failure'));
-  assert.deepEqual(f.sent, [{ type: 'abort', sid: 1 }]); assert.equal(f.handler.streams.size, 0);
+  assert.deepEqual(f.sent, [{ type: 'abort', sid: 1, closeCode: 1011 }]); assert.equal(f.handler.streams.size, 0);
 });
 test('early response completes while upload is unfinished', t => {
   const f = fixture(t); f.respond(f.res); f.res.emit('end');

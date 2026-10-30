@@ -8,9 +8,11 @@ are transport-validation inputs only.
 
 Suites cover authentication headers, redacted errors, shutdown, TLS, redirect
 refusal, destination pinning, backoff, heartbeat, origin probes and
-make-before-break. mock-tunnel.test.js runs a real agent against an in-process
+make-before-break. ws-frames.test.js covers frame boundaries, length encodings,
+masking, close tracking and invalid lengths. mock-tunnel.test.js runs a real agent against an in-process
 mock edge with buffered (v0) and streaming (v1) framing; it checks a 3 MiB echo
-across credit windows in both modes. stream-handler.test.js covers connector
+across credit windows in both modes and a negotiated v1 WebSocket upgrade with
+messages relayed in both directions. stream-handler.test.js covers connector
 header-wait, flow control, abort and early-response behavior. The mock is not a
 production edge and does not claim to validate routing or edge policy.
 The scanner walks untracked files too, rejects unscannable files, and has no
@@ -28,4 +30,4 @@ above.
 ## Validation
 
 The complete suite must pass on Node 20 or later with local sockets and
-subprocesses permitted. No container image has been built or validated.
+subprocesses permitted.
