@@ -1,0 +1,6 @@
+FastDog Agent
+Copyright 2026 Pete Spelic (FastDog Networks)
+
+This distribution depends on ws, licensed under the MIT License.
+The ws copyright notice and full MIT license are included in node_modules/ws/LICENSE
+when dependencies are installed; retain that license when redistributing ws.

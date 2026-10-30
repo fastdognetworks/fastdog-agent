@@ -1,0 +1,10 @@
+node_modules/
+.env
+.env.*
+*.log
+coverage/
+.scanner-fixture/
+.scanner-denylist-fixture
+# Private scanner input (see NAME_SCAN_DENYLIST in CONTRIBUTING.md) and the local review snapshot.
+.name-scan-denylist
+*.denylist

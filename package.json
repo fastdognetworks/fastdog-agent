@@ -1,0 +1,23 @@
+{
+  "name": "fastdog-agent",
+  "version": "0.2.1",
+  "type": "module",
+  "dependencies": {
+    "ws": "8.21.3"
+  },
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test test/",
+    "scan:names": "node test/helpers/name-scanner.js"
+  },
+  "files": [
+    "src",
+    "LICENSE",
+    "NOTICE",
+    "README.md"
+  ]
+}
