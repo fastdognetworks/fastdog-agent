@@ -11,7 +11,7 @@
   },
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test test/",
+    "test": "node --test test/*.test.js",
     "scan:names": "node test/helpers/name-scanner.js"
   },
   "files": [
